@@ -1,0 +1,300 @@
+---
+title: "MODEL 1 - Stacked Model"
+author: "FENDAWN F. RECENTES"
+date: "12/16/2022"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+## Helper and Modeling Packages
+
+```{r}
+library(rsample)  
+library(recipes)  
+library(tidyverse)
+library(h2o)       
+library(ROCR)
+library(pROC)
+```
+
+
+```{r}
+h2o.init()
+```
+
+## Load and view radiomics data set
+
+```{r}
+radiomics <- read_csv("normalRad.csv")
+view(radiomics)
+```
+
+# Convert target variable to a factor form
+
+```{r}
+radiomics$Failure.binary = as.factor(radiomics$Failure.binary)
+```
+
+
+# DATA PREPARATION AND SPLITTING
+
+
+# Split the data intro training (80%) and testing (20%) stratified in Failure.binary column
+
+```{r}
+set.seed(123)  # for reproducibility
+split <- initial_split(radiomics, strata = "Failure.binary")
+radiomics_train <- training(split)
+radiomics_test <- testing(split)
+```
+
+## Make sure we have consistent categorical levels
+
+```{r}
+blueprint <- recipe(Failure.binary ~ ., data = radiomics_train) %>%
+  step_other(all_nominal(), threshold = 0.005)
+```
+
+## Create training & test sets for h2o
+
+```{r}
+h2o.init()
+train_h2o <- prep(blueprint, training = radiomics_train, retain = TRUE) %>%
+  juice() %>%
+  as.h2o()
+test_h2o <- prep(blueprint, training = radiomics_train) %>%
+  bake(new_data = radiomics_test) %>%
+  as.h2o()
+```
+
+## Get response and feature names
+
+```{r}
+Y <- "Failure.binary"
+X <- setdiff(names(radiomics_train), Y)
+```
+
+## Train & cross-validate a GLM model
+
+```{r}
+best_glm <- h2o.glm(
+  x = X, y = Y, training_frame = train_h2o, alpha = 0.1,
+  remove_collinear_columns = TRUE, nfolds = 10, fold_assignment = "Modulo",
+  keep_cross_validation_predictions = TRUE, seed = 123
+)
+```
+
+## Train & cross-validate a RF model
+
+```{r}
+best_rf <- h2o.randomForest(
+  x = X, y = Y, training_frame = train_h2o, ntrees = 100, mtries = 20,
+  max_depth = 30, min_rows = 1, sample_rate = 0.8, nfolds = 10,
+  fold_assignment = "Modulo", keep_cross_validation_predictions = TRUE,
+  seed = 123, stopping_rounds = 50, stopping_metric = "logloss",
+  stopping_tolerance = 0
+)
+```
+
+## Train & cross-validate a GBM model
+
+```{r}
+best_gbm <- h2o.gbm(
+  x = X, y = Y, training_frame = train_h2o, ntrees = 100, learn_rate = 0.01,
+  max_depth = 7, min_rows = 5, sample_rate = 0.8, nfolds = 10,
+  fold_assignment = "Modulo", keep_cross_validation_predictions = TRUE,
+  seed = 123, stopping_rounds = 50, stopping_metric = "logloss",
+  stopping_tolerance = 0
+)
+```
+
+## Get results from base learners
+
+```{r}
+get_rmse <- function(model) {
+  results <- h2o.performance(model, newdata = test_h2o)
+  results@metrics$RMSE
+}
+list(best_glm, best_rf, best_gbm) %>%
+  purrr::map_dbl(get_rmse)
+```
+
+## Define GBM hyperparameter grid
+
+```{r}
+hyper_grid <- list(
+  max_depth = c(1, 3, 5),
+  min_rows = c(1, 5, 10),
+  learn_rate = c(0.01, 0.05, 0.1),
+  learn_rate_annealing = c(0.99, 1),
+  sample_rate = c(0.5, 0.75, 1),
+  col_sample_rate = c(0.8, 0.9, 1)
+)
+
+# Define random grid search criteria
+search_criteria <- list(
+  strategy = "RandomDiscrete",
+  max_models = 25
+)
+
+# Build random grid search 
+random_grid <- h2o.grid(
+  algorithm = "gbm", grid_id = "gbm_grid", x = X, y = Y,
+  training_frame = train_h2o, hyper_params = hyper_grid,
+  search_criteria = search_criteria, ntrees = 20, stopping_metric = "logloss",     
+  stopping_rounds = 10, stopping_tolerance = 0, nfolds = 10, 
+  fold_assignment = "Modulo", keep_cross_validation_predictions = TRUE,
+  seed = 123
+)
+```
+
+```{r}
+ensemble_tree <- h2o.stackedEnsemble(
+  x = X, y = Y, training_frame = train_h2o, model_id = "ensemble_gbm_grid",
+  base_models = random_grid@model_ids, metalearner_algorithm = "gbm",
+)
+```
+
+## Stacked results
+
+```{r}
+h2o.performance(ensemble_tree, newdata = test_h2o)@metrics$RMSE
+
+data.frame(
+  GLM_pred = as.vector(h2o.getFrame(best_glm@model$cross_validation_holdout_predictions_frame_id$name))%>%as.numeric(),
+  RF_pred = as.vector(h2o.getFrame(best_rf@model$cross_validation_holdout_predictions_frame_id$name))%>%as.numeric(),
+  GBM_pred = as.vector(h2o.getFrame(best_gbm@model$cross_validation_holdout_predictions_frame_id$name))%>%as.numeric()
+) %>% cor()
+```
+
+## Sort results by RMSE
+
+```{r}
+h2o.getGrid(
+  grid_id = "gbm_grid", 
+  sort_by = "logloss"
+)
+
+random_grid_perf <- h2o.getGrid(
+  grid_id = "gbm_grid", 
+  sort_by = "logloss"
+)
+```
+
+## Grab the model_id for the top model, chosen by validation error
+
+```{r}
+best_model_id <- random_grid_perf@model_ids[[1]]
+best_model <- h2o.getModel(best_model_id)
+h2o.performance(best_model, newdata = test_h2o)
+```
+## Train a stacked ensemble using the GBM grid
+
+```{r}
+ensemble <- h2o.stackedEnsemble(
+  x = X, y = Y, training_frame = train_h2o, model_id = "ensemble_gbm_grid",
+  base_models = random_grid@model_ids, metalearner_algorithm = "gbm"
+)
+```
+
+## Eval ensemble performance on a test set
+
+```{r}
+h2o.performance(ensemble, newdata = test_h2o)
+```
+# Use AutoML to find a list of candidate models (i.e., leaderboard)
+
+```{r}
+auto_ml <- h2o.automl(
+  x = X, y = Y, training_frame = train_h2o, nfolds = 5, 
+  max_runtime_secs = 60 * 120, max_models = 10,#max_models=50
+  keep_cross_validation_predictions = TRUE, sort_metric = "logloss", seed = 123,
+  stopping_rounds = 50, stopping_metric = "logloss", stopping_tolerance = 0
+)
+```
+
+# Assess the leader board; the following truncates the results to show the top 
+# and bottom 15 models. You can get the top model with auto_ml@leader
+
+```{r}
+auto_ml@leaderboard %>% 
+  as.data.frame() %>%
+  dplyr::select(model_id, logloss) %>%
+  dplyr::slice(1:25)
+
+```
+
+## Compute predicted probabilities on training data
+
+```{r}
+train_h2o = as.h2o(radiomics_train)
+
+m1_prob <- predict(auto_ml@leader, train_h2o, type = "prob")
+
+m1_prob = as.data.frame(m1_prob)[,2]
+
+train_h2o = as.data.frame(train_h2o)
+```
+
+## Compute AUC metrics 
+
+```{r}
+perf1 <- prediction(m1_prob,train_h2o$Failure.binary) %>%
+  performance(measure = "tpr", x.measure = "fpr")
+```
+
+## Plot AUC
+
+```{r}
+plot(perf1, col = "black", lty = 2)
+```
+
+## ROC plot for training data
+
+```{r}
+roc(train_h2o$Failure.binary ~ m1_prob, plot=TRUE, legacy.axes=FALSE, 
+    percent=TRUE, col="black", lwd=2, print.auc=TRUE)
+```
+
+## Compute predicted probabilities on testing data
+
+```{r}
+test_h2o = as.h2o(radiomics_test)
+
+m2_prob <- predict(auto_ml@leader, test_h2o, type = "prob")
+
+m2_prob=as.data.frame(m2_prob)[,2]
+
+test_h2o=as.data.frame(test_h2o)
+```
+
+## Compute AUC metrics
+
+```{r}
+perf2 <- prediction(m2_prob,test_h2o$Failure.binary) %>%
+  performance(measure = "tpr", x.measure = "fpr")
+```
+
+## Plot AUC
+
+```{r}
+plot(perf2, col = "black", lty = 2)
+```
+
+## ROC plot for testing data
+
+```{r}
+roc(test_h2o$Failure.binary ~ m2_prob, plot=TRUE, legacy.axes=FALSE, 
+    percent=TRUE, col="black", lwd=2, print.auc=TRUE)
+```
+
+## Plot the top 20 feature importance during training
+
+```{r}
+train_h2o = as.h2o(train_h2o)
+h2o.permutation_importance_plot(auto_ml@leader,train_h2o,num_of_features = 20)
+```
+
+
+
