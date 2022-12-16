@@ -1,0 +1,115 @@
+---
+title: "MODEL 2 - NEURAL NETWORK-BASED CLASSIFICATION MODEL"
+author: "FENDAWN F. RECENTES"
+date: "2022-12-13"
+output:
+  pdf_document: default
+  html_document:
+    df_print: paged
+---
+# Helper Packages AND  Model Packages
+```{r}
+library(dplyr)
+library(keras)
+library(tfruns) 
+library(rsample) 
+library(tfestimators) 
+library(readr)
+library(tensorflow)
+library(bestNormalize)
+library(tidyverse)
+```
+
+# We use the normalize radiomatics dataset here.
+
+## Load and view radiomics dataset
+
+```{r}
+radiomics = read_csv("RAD. NORMAL DATA.CSV")
+head(radiomics)
+```
+
+
+## Split the data into training (80) and testing (20). 
+
+```{r}
+df <- radiomics %>%
+  mutate(Failure.binary=ifelse(Failure.binary== "No",0,1))
+df=df[,-1]
+set.seed(123)
+split = initial_split(df,prop = 0.8 ,strata = "Failure.binary")
+radiomics_train <- training(split)
+radiomics_test  <- testing(split)
+
+#or 
+
+X_train <- radiomics_train[,-c(1,2)]%>%as.matrix.data.frame()
+X_test <- radiomics_test[,-c(1,2)]%>%as.matrix.data.frame()
+y_train <- radiomics_train$Failure.binary
+y_test <- radiomics_test$Failure.binary
+```
+
+
+## The model will have five hidden layers with 256, 128, 128, 64 and 64 neurons with activation functions of Sigmoid. The output layer will have 2 neurons for predicting a numeric value and a Softmax activation fuction. Every layer is followed by a dropout to avoid overfitting.
+
+## Reshaping the dataset
+
+```{r}
+X_train <- array_reshape(X_train, c(nrow(X_train), ncol(X_train)))
+X_train <- X_train 
+
+X_test <- array_reshape(X_test, c(nrow(X_test), ncol(X_test)))
+X_test <- X_test 
+
+y_train <- to_categorical(y_train, num_classes = 2)
+y_test <- to_categorical(y_test, num_classes = 2)
+
+model <- keras_model_sequential() %>%
+  layer_dense(units = 256, activation = "sigmoid", input_shape = c(ncol(X_train))) %>%
+  layer_dropout(rate = 0.2) %>%
+  layer_dense(units = 128, activation = "sigmoid") %>%
+  layer_dropout(rate = 0.2) %>%
+  layer_dense(units = 128, activation = "sigmoid") %>%
+  layer_dropout(rate = 0.2) %>%
+  layer_dense(units = 64, activation = "sigmoid") %>% 
+  layer_dropout(rate = 0.2) %>%
+  layer_dense(units = 64, activation = "sigmoid") %>% 
+  layer_dropout(rate = 0.2) %>%
+  layer_dense(units = 2, activation = "softmax")%>%
+ compile(
+    loss = "categorical_crossentropy",
+    optimizer = optimizer_rmsprop(),
+    metrics = c("accuracy")
+  )
+```
+
+
+## The model will be trained to minimize the categorical_crossentropy loss function using the effective Adam version of stochastic gradient descent. 
+
+## We will train the model for 10 epochs with a batch size of 128 samples and validation split of 0.15
+
+```{r}
+ model %>% compile(
+  loss = "categorical_crossentropy",
+  optimizer = optimizer_adam(),
+  metrics = c("accuracy")
+)
+
+history <- model %>% 
+  fit(X_train, y_train, epochs = 10, batch_size = 128, validation_split = 0.15)
+```
+
+## After the model is trained, we will evaluate it on the holdout test dataset
+
+```{r}
+model %>%
+  evaluate(X_test, y_test)
+dim(X_test)
+dim(y_test)
+```
+
+## Finally, model prediction using the testing dataset
+
+```{r}
+model %>% predict(X_test) %>% `>`(0.8) %>% k_cast("int32")
+```
