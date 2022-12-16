@@ -1,0 +1,303 @@
+---
+title: "MODEL 1 - GRADIENT BOOSTING"
+author: "FENDAWN F. RECENTES"
+date: "12/14/2022"
+output:
+  html_document: default
+  pdf_document: 
+    fig_width: 7
+---
+
+## HELPER PACKAGES 
+
+```{r}
+library(dplyr)    
+library(gbm)      
+library(h2o)      
+library(xgboost)  
+library(modeldata) 
+library(rsample)
+library(recipes)   
+library(caret)     
+library(ROCR)      
+library(pROC)      
+library(readr)
+library(tidyverse)
+library(bestNormalize)
+```
+
+
+## Load and view radiomatics dataset
+
+```{r}
+radiomics = read_csv("C:\\Users\\MSU-TCTO OVCAA\\Documents\\radiomics_completedata.csv")
+```
+
+
+# DATA PRE-PROCESSING
+
+## Check for null and missing values
+
+```{r}
+sum(is.na(radiomics))
+```
+
+## Check for normality
+```{r,warning=F}
+df <- radiomics%>%select_if(is.numeric) 
+df <- df[,-1]
+test_df <- apply(df,2,function(x){shapiro.test(x)})
+```
+
+## Convert a list to vector 
+```{r}
+pvalue_list <- unlist(lapply(test_df, function(x) x$p.value))
+```
+
+
+## Compute and identify variables that are not normally distributed
+
+## We have 428 variables that are not normally distributed
+
+```{r}
+sum(pvalue_list < 0.05)  
+```
+
+## We have one variable that is normally distributed and that is Entropy_cooc.W.ADC
+
+```{r}
+sum(pvalue_list > 0.05)
+```
+
+```{r}
+which.max(pvalue_list)
+```
+
+## Test for normality, the variable Entropy_cooc.W.ADC is normally distributed
+
+```{r}
+shapiro.test(radiomics$Entropy_cooc.W.ADC)
+```
+
+
+## To normalized the data, we remove the categorical, binary and Entropy_cooc.W.ADC variable
+
+```{r,warning=F}
+newdf1 = radiomics[,c(3,5:length(names(radiomics)))]
+
+newdf1 = apply(newdf1,2,orderNorm)
+newdf1 = lapply(newdf1, function(x) x$x.t)
+newdf1 = newdf1%>%as.data.frame()
+
+test_newdf1 = apply(newdf1,2,shapiro.test)
+pval_list2 = unlist(lapply(test_newdf1, function(x) x$p.value))
+```
+
+
+```{r,warning=F}
+sum(pval_list2 < 0.05)
+```
+
+```{r,warning=F}
+sum(pval_list2 > 0.05)
+```
+
+## New data is created
+
+```{r}
+newdata = select(radiomics, c("Failure.binary",  "Entropy_cooc.W.ADC"))
+new_radiomics = cbind(newdata,newdf1)
+```
+
+## Get the correlation of the whole data except the categorical variables
+
+```{r}
+CorMatrix=cor(new_radiomics[,-c(1,2)])
+heatmap(CorMatrix,Rowv=NA,Colv=NA,scale="none",revC = T)
+```
+
+
+# DATA PREPARATION AND SPLITTING
+
+# We use here the new normalized radiomics dataset
+
+## Load new normalized radiomics data
+```{r}
+radiomics = read_csv("C:\\Users\\MSU-TCTO OVCAA\\Documents\\normalRad.csv")
+```
+
+## Split the data intro training (80%) and testing (20%) stratified in Failure.binary column
+
+```{r}
+set.seed(123)
+split <- initial_time_split(radiomics, prop = 0.8, strata = "Failure.binary")
+radiomics_train <- training(split)
+radiomics_test <- testing(split)
+```
+
+## Training the dataset
+
+```{r}
+xgb_prep <- recipe(Failure.binary~ ., data = radiomics_train) %>%
+  step_integer(all_nominal()) %>%
+  prep(training = radiomics_train, retain = TRUE) %>%
+  juice()
+
+X <- as.matrix(xgb_prep[setdiff(names(xgb_prep), "Failure.binary")])
+Y <- xgb_prep$Failure.binary
+
+```
+
+## Hypergrid parameter
+
+```{r}
+hyper_grid <- expand.grid(
+  eta = 0.01,
+  max_depth = 3, 
+  min_child_weight = 3,
+  subsample = 0.5, 
+  colsample_bytree = 0.5,
+  gamma = c(0, 1, 10, 100, 1000),
+  lambda = c(0, 1e-2, 0.1, 1, 100, 1000, 10000),
+  alpha = c(0, 1e-2, 0.1, 1, 100, 1000, 10000)
+)
+
+```
+
+## Grid Search
+
+```{r, eval=FALSE}
+for(i in seq_len(nrow(hyper_grid))) {
+  set.seed(123)
+  m <- xgb.cv(
+    data = X,
+    label = Y,
+    nrounds = 100,
+    objective = "binary:logistic",
+    early_stopping_rounds = 5, 
+    nfold = 2,
+    verbose = 0,
+    params = list( 
+      eta = hyper_grid$eta[i], 
+      max_depth = hyper_grid$max_depth[i],
+      min_child_weight = hyper_grid$min_child_weight[i],
+      subsample = hyper_grid$subsample[i],
+      colsample_bytree = hyper_grid$colsample_bytree[i],
+      gamma = hyper_grid$gamma[i], 
+      lambda = hyper_grid$lambda[i], 
+      alpha = hyper_grid$alpha[i]
+    ) 
+  )
+  hyper_grid$rmse[i] <- min(m$evaluation_log$test_rmse_mean)
+  hyper_grid$trees[i] <- m$best_iteration
+}
+
+hyper_grid %>%
+  filter(rmse > 0) %>%
+  arrange(rmse) %>%
+  glimpse()
+
+# optimal parameter list
+params <- list(
+  eta = 0.01,
+  max_depth = 3,
+  min_child_weight = 3,
+  subsample = 0.5,
+  colsample_bytree = 0.5
+)
+```
+
+## Optimal parameter list
+
+```{r}
+params <- list(
+  eta = 0.01,
+  max_depth = 3,
+  min_child_weight = 3,
+  subsample = 0.5,
+  colsample_bytree = 0.5
+)
+```
+
+## Modelling the training data using XGBoost
+
+```{r}
+xgb.fit.final <- xgboost(
+  params = params,
+  data = X,
+  label = Y,
+  nrounds = 394,
+  objective = "binary:logistic",
+  verbose = 0
+)
+summary(xgb.fit.final)
+```
+
+## Plot the top 20 important features during training
+
+```{r}
+vip::vip(xgb.fit.final, num_features = 20)
+```
+
+## Prediction performance of the model using training data set
+
+```{r}
+pred_xgboosttrain<- predict(xgb.fit.final, X, type = "prob")
+pred_xgboosttrain
+```
+
+## Compute AUC metrics
+
+```{r}
+perf1 <- prediction(pred_xgboosttrain, radiomics_train$Failure.binary) %>%
+  performance(measure = "tpr", x.measure = "fpr")
+```
+
+
+## Prediction performance of the model in testing dataset
+
+```{r}
+xgb_preptest <- recipe(Failure.binary~ ., data = radiomics_test) %>%
+  step_integer(all_nominal()) %>%
+  prep(training = radiomics_test, retain = TRUE) %>%
+  juice()
+
+X1 <- as.matrix(xgb_preptest[setdiff(names(xgb_preptest), "Failure.binary")])
+```
+
+
+
+
+## Prediction performance of the model using testing data set
+
+```{r}
+pred_xgboosttest<- predict(xgb.fit.final, X1, type = "prob")
+pred_xgboosttest
+```
+
+## Compute AUC metrics
+
+```{r}
+perf2 <- prediction(pred_xgboosttest, radiomics_test$Failure.binary) %>%
+  performance(measure = "tpr", x.measure = "fpr")
+```
+
+## Training and Testing data performance plot
+
+```{r}
+par(mfrow = c(1,2))
+
+# Training prediction performance
+roc(radiomics_train$Failure.binary ~ pred_xgboosttrain, plot=TRUE, legacy.axes=FALSE, 
+    percent=TRUE, col="black", lwd=2, print.auc=TRUE, main = "Performane in Training")
+
+
+# Testing set prediction performance
+roc(radiomics_test$Failure.binary ~ pred_xgboosttest, plot=TRUE, legacy.axes=FALSE, 
+    percent=TRUE, col="red", lwd=2, print.auc=TRUE, main = "Performane in testing")
+
+```
+
+The performance during training has the highest AUC of 0.99 which indicates that it has the highest area
+under the curve compared to the performance during testing which has 0.943 AUC. 
+
